@@ -13,6 +13,9 @@ import 'tools.dart';
 abstract class FfRunner {
   Future<Probe> probe(String path);
   Future<FfResult> run(List<String> args, {double? totalSeconds, void Function(double f)? onProgress});
+
+  /// Ejecuta FFmpeg y devuelve todo su texto de salida (solo PC; en Android devuelve '').
+  Future<String> capture(List<String> args);
   Future<void> cancel();
 }
 
@@ -26,7 +29,19 @@ class AndroidRunner implements FfRunner {
       final info = s.getMediaInformation();
       final d = double.tryParse(info?.getDuration() ?? '') ?? 0;
       final b = int.tryParse(info?.getBitrate() ?? '') ?? 0;
-      return Probe(d, b);
+      var w = 0, h = 0;
+      var vc = '';
+      var audio = false;
+      for (final st in info?.getStreams() ?? []) {
+        final t = st.getType();
+        if (t == 'video' && w == 0) {
+          w = (st.getWidth() ?? 0).toInt();
+          h = (st.getHeight() ?? 0).toInt();
+          vc = st.getCodec() ?? '';
+        }
+        if (t == 'audio') audio = true;
+      }
+      return Probe(d, b, width: w, height: h, vcodec: vc, hasAudio: audio);
     } catch (_) {
       return const Probe(0, 0);
     }
@@ -58,6 +73,9 @@ class AndroidRunner implements FfRunner {
   }
 
   @override
+  Future<String> capture(List<String> args) async => '';
+
+  @override
   Future<void> cancel() async {
     try {
       await FFmpegKit.cancel();
@@ -73,16 +91,27 @@ class DesktopRunner implements FfRunner {
   Future<Probe> probe(String path) async {
     try {
       final r = await Process.run(Tools.ffprobe, [
-        '-v', 'error', '-show_entries', 'format=duration,bit_rate',
-        '-of', 'default=noprint_wrappers=1', path,
+        '-v', 'error',
+        '-show_entries', 'format=duration,bit_rate:stream=codec_type,codec_name,width,height',
+        '-of', 'json', path,
       ]);
-      double d = 0;
-      int b = 0;
-      for (final l in '${r.stdout}'.split('\n')) {
-        if (l.startsWith('duration=')) d = double.tryParse(l.substring(9).trim()) ?? 0;
-        if (l.startsWith('bit_rate=')) b = int.tryParse(l.substring(9).trim()) ?? 0;
+      final j = jsonDecode('${r.stdout}') as Map<String, dynamic>;
+      final f = (j['format'] as Map?) ?? {};
+      final d = double.tryParse('${f['duration']}') ?? 0;
+      final b = int.tryParse('${f['bit_rate']}') ?? 0;
+      var w = 0, h = 0;
+      var vc = '';
+      var audio = false;
+      for (final s in (j['streams'] as List?) ?? []) {
+        final m = s as Map;
+        if (m['codec_type'] == 'video' && w == 0) {
+          w = (m['width'] as num?)?.toInt() ?? 0;
+          h = (m['height'] as num?)?.toInt() ?? 0;
+          vc = '${m['codec_name'] ?? ''}';
+        }
+        if (m['codec_type'] == 'audio') audio = true;
       }
-      return Probe(d, b);
+      return Probe(d, b, width: w, height: h, vcodec: vc, hasAudio: audio);
     } catch (_) {
       return const Probe(0, 0);
     }
@@ -111,6 +140,16 @@ class DesktopRunner implements FfRunner {
     final lines = err.toString().trim().split('\n');
     final tail = lines.length > 12 ? lines.sublist(lines.length - 12) : lines;
     return FfResult(code == 0, _killed, tail.join('\n'));
+  }
+
+  @override
+  Future<String> capture(List<String> args) async {
+    try {
+      final r = await Process.run(Tools.ffmpeg, ['-hide_banner', '-nostdin', ...args]);
+      return '${r.stderr}\n${r.stdout}';
+    } catch (_) {
+      return '';
+    }
   }
 
   @override

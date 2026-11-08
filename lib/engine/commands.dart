@@ -2,13 +2,50 @@ import 'dart:math';
 
 import 'models.dart';
 
-String videoExt(Options o) {
-  final av1 = o.preset.id == 'av1' || (o.preset.id == 'custom' && o.codec == 'av1');
-  return (av1 && o.container == 'mov') ? 'mkv' : o.container;
+class _Base {
+  const _Base(this.crf, this.pc, this.mob, [this.codec = 'hevc', this.extra = '']);
+  final int crf; // en escala HEVC
+  final String pc, mob, codec, extra;
 }
 
-/// Devuelve una lista de intentos: si el primero falla (p. ej. no hay NVENC o
-/// MediaCodec), se prueba el siguiente.
+const _bases = <String, _Base>{
+  'hw': _Base(25, 'medium', 'veryfast'),
+  'balanced': _Base(25, 'medium', 'veryfast'),
+  'visual': _Base(20, 'slow', 'faster'),
+  'max': _Base(28, 'slow', 'fast', 'hevc', 'aq-mode=3'),
+  'social': _Base(29, 'medium', 'veryfast'),
+  'compat': _Base(26, 'slow', 'veryfast', 'h264'),
+  'av1': _Base(27, 'slow', 'fast', 'av1'),
+};
+
+/// Códec que se usará: el que elija la persona o, en "auto", el propio del modo.
+String effectiveCodec(Options o) {
+  final base = o.preset.id == 'custom' ? 'hevc' : (_bases[o.preset.id]?.codec ?? 'hevc');
+  return o.codec == 'auto' ? base : o.codec;
+}
+
+String videoExt(Options o) {
+  if (o.audioOnly) return o.audioFormat;
+  return (effectiveCodec(o) == 'av1' && o.container == 'mov') ? 'mkv' : o.container;
+}
+
+List<String> audioArgs(String input, String out, Options o, double? ss, double? t) {
+  final k = o.audio == 0 ? 128 : o.audio;
+  return [
+    '-y',
+    if (ss != null) ...['-ss', ss.toStringAsFixed(2)],
+    if (t != null) ...['-t', t.toStringAsFixed(2)],
+    '-i', input, '-vn', '-map', '0:a:0',
+    ...(o.audioFormat == 'mp3'
+        ? ['-c:a', 'libmp3lame', '-b:a', '${k}k']
+        : ['-c:a', 'aac', '-b:a', '${k}k']),
+    if (o.stripMeta) ...['-map_metadata', '-1'],
+    out,
+  ];
+}
+
+/// Lista de intentos: si el primero falla (sin NVENC/MediaCodec) se prueba el siguiente.
+/// [kbps] != null => modo "peso objetivo" (bitrate fijo en lugar de calidad CRF).
 List<List<String>> videoAttempts(
   String input,
   String out,
@@ -18,135 +55,154 @@ List<List<String>> videoAttempts(
   required bool nvenc,
   double? ss,
   double? t,
+  int? kbps,
 }) {
+  if (o.audioOnly) return [audioArgs(input, out, o, ss, t)];
+
   final id = o.preset.id;
+  final base = id == 'custom'
+      ? _Base(o.crf.round(), 'medium', 'veryfast')
+      : (_bases[id] ?? _bases['balanced']!);
+  final codec = effectiveCodec(o);
+  final crf = o.crfOverride ?? base.crf;
+  final speed = pc ? base.pc : base.mob;
   final cont = out.split('.').last.toLowerCase();
   final apple = cont == 'mp4' || cont == 'mov';
-  final tag = apple ? ['-tag:v', 'hvc1'] : <String>[];
-  final custom = id == 'custom';
-  final height = id == 'social' ? 720 : (custom ? o.height : 0);
-  final audio = id == 'social' ? 96 : (custom ? o.audio : 128);
+  final hvc = (apple && codec == 'hevc') ? ['-tag:v', 'hvc1'] : <String>[];
 
-  List<String> x265(String preset, int crf, {String extra = ''}) => [
-        '-c:v', 'libx265', '-preset', preset, '-crf', '$crf',
-        '-x265-params', 'log-level=error${extra.isEmpty ? '' : ':$extra'}',
-        '-pix_fmt', 'yuv420p', ...tag,
-      ];
-  List<String> x264(String preset, int crf) => [
-        '-c:v', 'libx264', '-preset', preset, '-crf', '$crf',
+  List<String> rate(int k) => ['-b:v', '${k}k', '-maxrate', '${(k * 1.3).round()}k', '-bufsize', '${k * 2}k'];
+
+  List<String> software() {
+    if (codec == 'h264') {
+      return [
+        '-c:v', 'libx264', '-preset', speed,
+        ...(kbps != null ? rate(kbps) : ['-crf', '${max(14, min(35, crf - 5))}']),
         '-profile:v', 'high', '-pix_fmt', 'yuv420p',
       ];
-  List<String> av1(int crf) => ['-c:v', 'libsvtav1', '-preset', '5', '-crf', '$crf', '-pix_fmt', 'yuv420p'];
-
-  final List<List<String>> vcodecs;
-  if (id == 'hw') {
-    if (pc && nvenc) {
-      vcodecs = [
-        [
-          '-c:v', 'hevc_nvenc', '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-cq', '27',
-          '-b:v', '0', '-spatial-aq', '1', '-temporal-aq', '1', '-rc-lookahead', '32',
-          '-multipass', 'fullres', '-pix_fmt', 'yuv420p', ...tag,
-        ],
-        x265('medium', 25),
-      ];
-    } else if (pc) {
-      vcodecs = [x265('medium', 25)];
-    } else {
-      final kb = pr.bitrate > 0 ? ((pr.bitrate * 0.45) / 1000).round().clamp(700, 14000) : 4000;
-      vcodecs = [
-        ['-c:v', 'hevc_mediacodec', '-b:v', '${kb}k', '-pix_fmt', 'nv12', ...tag],
-        x265('veryfast', 27),
+    }
+    if (codec == 'av1') {
+      final svt = speed == 'slow' ? '5' : (speed == 'medium' ? '6' : '8');
+      return [
+        '-c:v', 'libsvtav1', '-preset', svt,
+        ...(kbps != null ? rate(kbps) : ['-crf', '${min(63, crf + 5)}']),
+        '-pix_fmt', 'yuv420p',
       ];
     }
-  } else if (id == 'balanced') {
-    vcodecs = [x265(pc ? 'medium' : 'veryfast', pc ? 25 : 26)];
-  } else if (id == 'visual') {
-    vcodecs = [x265(pc ? 'slow' : 'faster', 20)];
-  } else if (id == 'max') {
-    vcodecs = [x265(pc ? 'slow' : 'fast', 28, extra: 'aq-mode=3')];
-  } else if (id == 'social') {
-    vcodecs = [x265(pc ? 'medium' : 'veryfast', 29)];
-  } else if (id == 'compat') {
-    vcodecs = [x264(pc ? 'slow' : 'veryfast', pc ? 22 : 24)];
-  } else if (id == 'av1') {
-    vcodecs = [av1(32)];
-  } else {
-    final crf = o.crf.round();
-    if (o.codec == 'h264') {
-      vcodecs = [x264(pc ? 'slow' : 'veryfast', crf)];
-    } else if (o.codec == 'av1') {
-      vcodecs = [av1(min(63, crf + 6))];
-    } else {
-      vcodecs = [x265(pc ? 'medium' : 'veryfast', crf)];
-    }
+    return [
+      '-c:v', 'libx265', '-preset', speed,
+      ...(kbps != null ? rate(kbps) : ['-crf', '$crf']),
+      '-x265-params', 'log-level=error${base.extra.isEmpty ? '' : ':${base.extra}'}',
+      '-pix_fmt', 'yuv420p', ...hvc,
+    ];
   }
 
-  final vf = height > 0 ? ['-vf', "scale=-2:'min($height,ih)'"] : <String>[];
-  final au = audio == 0 ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '${audio}k'];
+  List<String>? hardware() {
+    if (id != 'hw' || codec == 'av1') return null;
+    if (pc && nvenc) {
+      final q = codec == 'h264' ? crf - 3 : crf + 2;
+      return [
+        '-c:v', codec == 'h264' ? 'h264_nvenc' : 'hevc_nvenc',
+        '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr',
+        ...(kbps != null
+            ? ['-b:v', '${kbps}k', '-maxrate', '${(kbps * 1.3).round()}k']
+            : ['-cq', '$q', '-b:v', '0']),
+        '-spatial-aq', '1', '-temporal-aq', '1', '-rc-lookahead', '32',
+        '-multipass', 'fullres', '-pix_fmt', 'yuv420p', ...hvc,
+      ];
+    }
+    if (!pc) {
+      final k = kbps ??
+          (pr.bitrate > 0
+              ? max(700, min(14000, ((pr.bitrate * (codec == 'h264' ? .6 : .45)) / 1000).round()))
+              : 4000);
+      return ['-c:v', codec == 'h264' ? 'h264_mediacodec' : 'hevc_mediacodec', '-b:v', '${k}k', '-pix_fmt', 'nv12', ...hvc];
+    }
+    return null;
+  }
+
+  final encoders = <List<String>>[
+    if (hardware() != null) hardware()!,
+    software(),
+  ];
+
+  final vfs = <String>[
+    if (o.denoise == 'soft') 'hqdn3d=2:1.5:3:2.5',
+    if (o.denoise == 'strong') 'hqdn3d=4:3:6:4.5',
+    if (o.height > 0) "scale=-2:'min(${o.height},ih)'",
+  ];
+  final vf = vfs.isEmpty ? <String>[] : ['-vf', vfs.join(',')];
+  final au = o.noAudio
+      ? ['-an']
+      : (o.audio == 0 ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '${o.audio}k']);
+  final meta = o.stripMeta ? ['-map_metadata', '-1', '-map_chapters', '-1'] : ['-map_metadata', '0'];
   final fin = apple ? ['-movflags', '+faststart'] : <String>[];
 
   return [
-    for (final vc in vcodecs)
+    for (final enc in encoders)
       [
         '-y',
         if (ss != null) ...['-ss', ss.toStringAsFixed(2)],
         if (t != null) ...['-t', t.toStringAsFixed(2)],
         '-i', input,
-        '-map', '0:v:0', '-map', '0:a?', '-sn', '-dn', '-map_metadata', '0',
-        ...vf, ...vc, ...au, ...fin, out,
+        '-map', '0:v:0', if (!o.noAudio) ...['-map', '0:a?'], '-sn', '-dn',
+        ...meta, ...vf, ...enc, ...au, ...fin, out,
       ],
   ];
 }
 
+// ------------------------------------------------------------------- fotos
 String photoExt(Options o) {
+  if (o.imgFormat != 'auto') return o.imgFormat;
+  return o.preset.id == 'p_jpg' ? 'jpg' : 'webp';
+}
+
+int photoBaseQuality(Options o) {
   switch (o.preset.id) {
+    case 'p_web':
+      return 85;
     case 'p_jpg':
-      return 'jpg';
-    case 'custom':
-      return o.imgFormat;
+      return 90;
+    case 'p_bal':
+      return 80;
+    case 'p_min':
+      return 70;
+    case 'p_lossless':
+      return 85;
     default:
-      return 'webp';
+      return o.quality;
   }
 }
 
-List<String> photoArgs(String input, String out, Options o) {
-  final id = o.preset.id;
-  var side = 0;
-  var q = 80;
-  var lossless = false;
-  var fmt = 'webp';
-  switch (id) {
-    case 'p_web':
-      q = 85;
-      break;
-    case 'p_jpg':
-      fmt = 'jpg';
-      q = 90;
-      break;
+int photoSide(Options o) {
+  switch (o.preset.id) {
     case 'p_bal':
-      side = 2560;
-      q = 80;
-      break;
+      return 2560;
     case 'p_min':
-      side = 1600;
-      q = 70;
-      break;
-    case 'p_lossless':
-      lossless = true;
-      break;
+      return 1600;
+    case 'custom':
+      return o.maxSide;
     default:
-      side = o.maxSide;
-      q = o.quality;
-      fmt = o.imgFormat;
+      return 0;
   }
-  final vf = side > 0
-      ? ['-vf', "scale=w='min($side,iw)':h='min($side,ih)':force_original_aspect_ratio=decrease"]
-      : <String>[];
-  final codec = fmt == 'jpg'
-      ? ['-c:v', 'mjpeg', '-q:v', '${((100 - q) * 0.31).round().clamp(2, 31)}', '-pix_fmt', 'yuvj420p']
+}
+
+/// [qOverride]/[shrink] los usa el modo "peso objetivo" para probar calidades menores.
+List<String> photoArgs(String input, String out, Options o, {int? qOverride, double shrink = 1.0}) {
+  final side = photoSide(o);
+  final q = qOverride ?? photoBaseQuality(o);
+  final lossless = o.preset.id == 'p_lossless' && qOverride == null;
+  final jpg = photoExt(o) == 'jpg';
+  final filters = <String>[
+    if (side > 0)
+      "scale=w='min($side,iw)':h='min($side,ih)':force_original_aspect_ratio=decrease",
+    if (shrink < 1) "scale='trunc(iw*$shrink/2)*2':'trunc(ih*$shrink/2)*2'",
+  ];
+  final vf = filters.isEmpty ? <String>[] : ['-vf', filters.join(',')];
+  final codec = jpg
+      ? ['-c:v', 'mjpeg', '-q:v', '${max(2, min(31, ((100 - q) * 0.31).round()))}', '-pix_fmt', 'yuvj420p']
       : [
           '-c:v', 'libwebp', '-quality', '$q', '-compression_level', '6',
           if (lossless) ...['-lossless', '1'],
         ];
-  return ['-y', '-i', input, ...vf, '-frames:v', '1', ...codec, out];
+  return ['-y', '-i', input, ...vf, '-map_metadata', '-1', '-frames:v', '1', ...codec, out];
 }

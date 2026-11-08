@@ -2,6 +2,9 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 
+import '../engine/compressor.dart';
+import '../engine/history.dart';
+import '../engine/native.dart';
 import '../engine/tools.dart';
 import 'fx.dart';
 import 'home.dart';
@@ -41,6 +44,9 @@ class _SplashState extends State<Splash> with SingleTickerProviderStateMixin {
   void initState() {
     super.initState();
     Tools.init(); // detecta NVENC, Ghostscript y 7-Zip mientras corre la animación
+    Native.loadDevice(); // datos del celular (32/64 bits, RAM, HEVC por hardware)
+    history.load();
+    Compressor.cleanTemp(); // borra temporales viejos
     final reduce = WidgetsBinding.instance.platformDispatcher.accessibilityFeatures.disableAnimations;
     if (reduce) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _next());

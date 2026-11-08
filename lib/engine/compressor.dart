@@ -35,6 +35,7 @@ class Compressor {
   final FfRunner ff = createRunner();
   bool _cancelled = false;
   Process? _proc;
+  final _autoCache = <String, int>{};
 
   Future<void> cancel() async {
     _cancelled = true;
@@ -42,13 +43,48 @@ class Compressor {
     _proc?.kill();
   }
 
-  Future<String> _tmpDir() async {
+  // ------------------------------------------------------------ carpetas
+  static Future<String> tmpDir() async {
     final d = Directory(p.join((await getTemporaryDirectory()).path, 'squeeze_out'));
     await d.create(recursive: true);
     return d.path;
   }
 
-  Future<String> _outDir(Item it) async => Platform.isAndroid ? _tmpDir() : p.dirname(it.path);
+  /// Borra temporales viejos (más de un día) de resultados y copias de "Compartir".
+  static Future<void> cleanTemp({bool everything = false}) async {
+    try {
+      final root = (await getTemporaryDirectory()).path;
+      final limit = DateTime.now().subtract(const Duration(days: 1));
+      for (final name in ['squeeze_out', 'shared', 'file_picker']) {
+        final d = Directory(p.join(root, name));
+        if (!await d.exists()) continue;
+        await for (final e in d.list()) {
+          try {
+            if (everything || (await e.stat()).modified.isBefore(limit)) {
+              await e.delete(recursive: true);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  static Future<int> tempBytes() async {
+    var total = 0;
+    try {
+      final root = (await getTemporaryDirectory()).path;
+      for (final name in ['squeeze_out', 'shared', 'file_picker']) {
+        final d = Directory(p.join(root, name));
+        if (!await d.exists()) continue;
+        await for (final e in d.list(recursive: true)) {
+          if (e is File) total += await e.length();
+        }
+      }
+    } catch (_) {}
+    return total;
+  }
+
+  Future<String> _outDir(Item it) async => Platform.isAndroid ? tmpDir() : p.dirname(it.path);
 
   Future<String> _unique(String dir, String base, String ext) async {
     var path = p.join(dir, '$base.$ext');
@@ -67,11 +103,14 @@ class Compressor {
     } catch (_) {}
   }
 
+  // ----------------------------------------------------------- principal
   /// [sample] != null => solo procesa ese porcentaje del video (vista previa).
-  Future<Outcome> run(Item it, Options o, {double? sample, Progress? onProgress}) async {
+  Future<Outcome> run(Item it, Options o0,
+      {double? sample, Progress? onProgress, String? outDirOverride}) async {
     _cancelled = false;
+    final o = o0.copy();
     try {
-      final dir = sample != null ? await _tmpDir() : await _outDir(it);
+      final dir = sample != null ? await tmpDir() : (outDirOverride ?? await _outDir(it));
       final k = o.preset.kind;
       Outcome r;
       if (k == Kind.video) {
@@ -90,58 +129,208 @@ class Compressor {
     }
   }
 
-  Future<Outcome> _done(Item it, String out, {bool sample = false, double? secs}) async {
+  Future<Outcome> _done(Item it, String out,
+      {bool sample = false, double? secs, double? start, String? note}) async {
     final size = await File(out).length();
     if (!sample && size >= it.bytes) {
       await _rm(out);
       return Outcome(it,
           note: 'Este archivo ya estaba muy optimizado: el resultado pesaba igual o más, así que no se guardó.');
     }
-    return Outcome(it, path: out, outBytes: size, sampleSeconds: secs);
+    return Outcome(it, path: out, outBytes: size, sampleSeconds: secs, sampleStart: start, note: note);
   }
 
-  // ------------------------------------------------------------------ video
+  /// Extrae un fotograma (para el comparador antes/después de video).
+  Future<String?> frame(String path, double at, String tag) async {
+    final out = p.join(await tmpDir(), '${tag}_${DateTime.now().microsecondsSinceEpoch}.jpg');
+    final r = await ff.run(['-y', '-ss', at.toStringAsFixed(2), '-i', path, '-frames:v', '1', '-q:v', '2', out]);
+    return r.ok ? out : null;
+  }
+
+  // ----------------------------------------------------------------- video
   Future<Outcome> _video(Item it, Options o, String dir, double? sample, Progress? cb) async {
     cb?.call(null, 'Leyendo el video…');
     final pr = await ff.probe(it.path);
-    double? ss, t;
-    var total = pr.duration;
-    if (sample != null && pr.duration > 0) {
-      t = min(pr.duration, min(90.0, max(3.0, pr.duration * sample)));
-      ss = max(0.0, (pr.duration - t) / 2);
-      total = t;
+    if (o.audioOnly && !pr.hasAudio && pr.duration > 0) {
+      return Outcome(it, error: 'Este video no tiene pista de audio.');
     }
+
+    // Rango de trabajo (recorte) y, si es vista previa, un trozo del medio.
+    final dur = pr.duration;
+    final a = dur > 0 ? max(0.0, min(o.trimStart, dur)) : 0.0;
+    var b = dur > 0 ? (o.trimEnd > 0 ? min(o.trimEnd, dur) : dur) : 0.0;
+    if (dur > 0 && b <= a) b = dur;
+    final range = dur > 0 ? b - a : 0.0;
+    final trimmed = dur > 0 && (a > .01 || b < dur - .01);
+    double? ss, t;
+    var total = range;
+    if (sample != null && range > 0) {
+      t = min(range, min(90.0, max(3.0, range * sample)));
+      ss = a + max(0.0, (range - t) / 2);
+      total = t;
+    } else if (trimmed) {
+      ss = a;
+      t = range;
+    }
+
+    // Calidad automática (VMAF, solo PC)
+    if (o.auto && Tools.isPc && Tools.vmaf && !o.audioOnly && o.targetMB == 0) {
+      final crf = await _autoCrf(it, o, pr, a, range, cb);
+      if (_cancelled) return Outcome(it, error: 'Cancelado');
+      if (crf != null) o.crfOverride = crf;
+    }
+
+    // Peso objetivo: bitrate fijo calculado a partir de la duración.
+    int? kbps;
+    if (o.targetMB > 0 && range > 0 && !o.audioOnly) {
+      final audioK = o.noAudio ? 0 : (o.audio == 0 ? 128 : o.audio);
+      kbps = max(150, ((o.targetMB * 1024 * 1024 * 8 * .97) / range / 1000).round() - audioK);
+    }
+
     final stem = p.basenameWithoutExtension(it.name);
     final out = await _unique(dir, sample != null ? '${stem}_muestra' : '${stem}_squeeze', videoExt(o));
-    final attempts = videoAttempts(it.path, out, pr, o,
-        pc: Tools.isPc, nvenc: Tools.nvenc, ss: ss, t: t);
 
     var r = const FfResult(false, false, '');
-    for (var i = 0; i < attempts.length; i++) {
-      cb?.call(0, i == 0 ? 'Comprimiendo…' : 'Reintentando con el modo de respaldo…');
-      r = await ff.run(attempts[i], totalSeconds: total, onProgress: (f) {
-        cb?.call(f, 'Comprimiendo… ${(f * 100).round()} %');
-      });
-      if (r.ok || r.cancelled) break;
+    for (var round = 0; round < 3; round++) {
+      final attempts = videoAttempts(it.path, out, pr, o,
+          pc: Tools.isPc, nvenc: Tools.nvenc, ss: ss, t: t, kbps: kbps);
+      for (var i = 0; i < attempts.length; i++) {
+        cb?.call(0, i == 0 ? 'Comprimiendo…' : 'Reintentando con el modo de respaldo…');
+        r = await ff.run(attempts[i], totalSeconds: total, onProgress: (f) {
+          cb?.call(f, 'Comprimiendo… ${(f * 100).round()} %');
+        });
+        if (r.ok || r.cancelled) break;
+      }
+      if (!r.ok) break;
+      if (kbps != null && sample == null) {
+        final size = await File(out).length();
+        final target = o.targetMB * 1024 * 1024;
+        if (size > target * 1.03 && round < 2) {
+          kbps = max(100, (kbps * target / size * .96).round());
+          cb?.call(0, 'Ajustando para llegar a ${o.targetMB} MB…');
+          await _rm(out);
+          continue;
+        }
+      }
+      break;
     }
     if (!r.ok) {
       await _rm(out);
       return Outcome(it,
           error: r.cancelled ? 'Cancelado' : (r.log.isNotEmpty ? r.log : 'FFmpeg no pudo procesar este video.'));
     }
-    return _done(it, out, sample: sample != null, secs: t);
+
+    String? note;
+    if (kbps != null && sample == null) {
+      final size = await File(out).length();
+      if (size > o.targetMB * 1024 * 1024 * 1.1) {
+        note = 'Quedó en ${fmtBytes(size)}: no se pudo llegar a ${o.targetMB} MB sin arruinar la imagen.';
+      }
+    }
+    if (o.crfOverride != null && o.auto) note = 'Calidad automática elegida: CRF ${o.crfOverride}.';
+    return _done(it, out, sample: sample != null || o.audioOnly, secs: t, start: ss, note: note);
+  }
+
+  /// Busca el CRF más alto (más compresión) cuyo VMAF siga sobre el objetivo.
+  Future<int?> _autoCrf(Item it, Options o, Probe pr, double a, double range, Progress? cb) async {
+    if (range <= 0) return null;
+    final key = '${it.path}|${o.preset.id}|${effectiveCodec(o)}|${o.vmaf}|${o.height}|${o.denoise}|$a|$range';
+    final hit = _autoCache[key];
+    if (hit != null) return hit;
+
+    final len = min(range, 20.0);
+    final s = a + max(0.0, (range - len) / 2);
+    final tmp = await tmpDir();
+    var lo = 18, hi = 34;
+    int? best;
+    double? bestScore;
+    for (var i = 0; i < 5 && lo <= hi; i++) {
+      final mid = (lo + hi) ~/ 2;
+      final po = o.copy()..crfOverride = mid;
+      final enc = p.join(tmp, 'auto_${DateTime.now().microsecondsSinceEpoch}.mkv');
+      cb?.call(null, 'Buscando la mejor calidad… prueba ${i + 1} de 5 (CRF $mid)');
+      var ok = false;
+      for (final at in videoAttempts(it.path, enc, pr, po, pc: true, nvenc: Tools.nvenc, ss: s, t: len)) {
+        final r = await ff.run(at, totalSeconds: len);
+        if (r.cancelled) {
+          await _rm(enc);
+          return null;
+        }
+        if (r.ok) {
+          ok = true;
+          break;
+        }
+      }
+      if (!ok) {
+        await _rm(enc);
+        return null;
+      }
+      final score = await _vmaf(enc, it.path, s, len, pr);
+      await _rm(enc);
+      if (score == null) return null;
+      if (score >= o.vmaf) {
+        best = mid;
+        bestScore = score;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    final r = best ?? 18;
+    cb?.call(null, 'Calidad elegida: CRF $r${bestScore != null ? ' (VMAF ${bestScore.toStringAsFixed(1)})' : ''}');
+    _autoCache[key] = r;
+    return r;
+  }
+
+  Future<double?> _vmaf(String enc, String src, double ss, double len, Probe pr) async {
+    final scale = (pr.width > 0 && pr.height > 0) ? 'scale=${pr.width}:${pr.height}:flags=bicubic,' : '';
+    final threads = max(2, Platform.numberOfProcessors ~/ 2);
+    final out = await ff.capture([
+      '-i', enc,
+      '-ss', ss.toStringAsFixed(2), '-t', len.toStringAsFixed(2), '-i', src,
+      '-lavfi',
+      '[0:v]${scale}setpts=PTS-STARTPTS[d];[1:v]setpts=PTS-STARTPTS[r];[d][r]libvmaf=n_threads=$threads',
+      '-an', '-f', 'null', '-',
+    ]);
+    final m = RegExp(r'VMAF score:\s*([0-9.]+)').firstMatch(out);
+    return m == null ? null : double.tryParse(m.group(1)!);
   }
 
   // ------------------------------------------------------------------ foto
   Future<Outcome> _photo(Item it, Options o, String dir, Progress? cb) async {
     cb?.call(null, 'Comprimiendo imagen…');
     final out = await _unique(dir, '${p.basenameWithoutExtension(it.name)}_squeeze', photoExt(o));
-    final r = await ff.run(photoArgs(it.path, out, o));
+    FfResult r;
+    String? note;
+    if (o.targetKB > 0) {
+      final target = o.targetKB * 1024;
+      var q = photoBaseQuality(o);
+      var shrink = 1.0;
+      r = const FfResult(false, false, '');
+      for (var i = 0; i < 9; i++) {
+        cb?.call(null, 'Ajustando a ${o.targetKB} KB… (intento ${i + 1})');
+        r = await ff.run(photoArgs(it.path, out, o, qOverride: q, shrink: shrink));
+        if (!r.ok) break;
+        if (await File(out).length() <= target) break;
+        if (q > 45) {
+          q = max(40, q - 15);
+        } else {
+          shrink *= .8;
+        }
+      }
+      if (r.ok) {
+        final size = await File(out).length();
+        if (size > target) note = 'Quedó en ${fmtBytes(size)}: no se pudo llegar a ${o.targetKB} KB.';
+      }
+    } else {
+      r = await ff.run(photoArgs(it.path, out, o));
+    }
     if (!r.ok) {
       await _rm(out);
-      return Outcome(it, error: r.cancelled ? 'Cancelado' : (r.log.isNotEmpty ? r.log : 'No se pudo procesar la imagen.'));
+      return Outcome(it,
+          error: r.cancelled ? 'Cancelado' : (r.log.isNotEmpty ? r.log : 'No se pudo procesar la imagen.'));
     }
-    return _done(it, out);
+    return _done(it, out, note: note);
   }
 
   // ------------------------------------------------------------------- pdf
@@ -222,10 +411,15 @@ class Compressor {
     final zip = id == 'f_zip';
     final out = await _unique(dir, p.basenameWithoutExtension(it.name), zip ? 'zip' : '7z');
     cb?.call(0, 'Comprimiendo con 7-Zip…');
+    final pw0 = o.password;
     final (code, err) = await _exec(
       Tools.sevenZip!,
-      ['a', zip ? '-tzip' : '-t7z', zip ? '-mm=Deflate' : '-m0=lzma2', '-mx=9', '-mmt=on',
-        '-bso0', '-bsp1', '-y', out, it.path],
+      [
+        'a', zip ? '-tzip' : '-t7z', zip ? '-mm=Deflate' : '-m0=lzma2', '-mx=9', '-mmt=on',
+        if (pw0.isNotEmpty) '-p$pw0',
+        if (pw0.isNotEmpty) (zip ? '-mem=AES256' : '-mhe=on'),
+        '-bso0', '-bsp1', '-y', out, it.path,
+      ],
       onOut: (s) {
         final m = RegExp(r'(\d{1,3})%').allMatches(s);
         if (m.isNotEmpty) {
@@ -237,6 +431,10 @@ class Compressor {
     if (code != 0) {
       await _rm(out);
       return Outcome(it, error: err.isEmpty ? '7-Zip falló (código $code).' : err);
+    }
+    // Un archivo cifrado puede pesar un poco más; con contraseña siempre se guarda.
+    if (pw0.isNotEmpty) {
+      return Outcome(it, path: out, outBytes: await File(out).length(), note: 'Protegido con contraseña.');
     }
     return _done(it, out);
   }

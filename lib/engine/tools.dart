@@ -13,6 +13,7 @@ class Tools {
   static String? sevenZip;
   static bool nvenc = false;
   static bool svtav1 = false;
+  static bool vmaf = false;
 
   static Future<void>? _init;
   static Future<void> init() => _init ??= _doInit();
@@ -34,6 +35,8 @@ class Tools {
       final enc = await Process.run(ffmpeg, ['-hide_banner', '-encoders']);
       final out = '${enc.stdout}';
       svtav1 = out.contains('libsvtav1');
+      final fl = await Process.run(ffmpeg, ['-hide_banner', '-filters']);
+      vmaf = '${fl.stdout}'.contains('libvmaf');
       if (out.contains('hevc_nvenc')) nvenc = await _testNvenc();
     } catch (_) {}
   }

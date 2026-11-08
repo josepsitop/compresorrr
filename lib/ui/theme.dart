@@ -11,6 +11,8 @@ class C {
   static const muted = Color(0xFF65708C);
   static const line = Color(0xFFDCE2F0);
   static const warn = Color(0xFFD9542C);
+  static const noteBg = Color(0xFFFFF3D6);
+  static const noteFg = Color(0xFF7A4B00);
 }
 
 ThemeData buildTheme() {
