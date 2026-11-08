@@ -1,0 +1,25 @@
+name: squeeze
+description: Comprime fotos, videos, PDF y archivos en Android y Windows.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffmpeg_kit_flutter_new: ^4.5.3
+  file_picker: ^8.1.4
+  path_provider: ^2.1.5
+  path: ^1.9.0
+  open_filex: ^4.5.0
+  share_plus: ^10.1.4
+  gal: ^2.3.1
+  wakelock_plus: ^1.2.8
+  printing: ^5.13.4
+  pdf: ^3.11.1
+  image: ^4.3.0
+
+flutter:
+  uses-material-design: true
