@@ -33,6 +33,19 @@ jobs:
           cp -r /tmp/lib_bak lib
           python3 tool/patch_android.py
       - run: flutter pub get
+      - name: Forzar compileSdk 36 en los plugins
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/compilesdk.gradle <<'EOF'
+          allprojects {
+              afterEvaluate { p ->
+                  def ext = p.extensions.findByName('android')
+                  if (ext != null && p.name != 'app') {
+                      ext.compileSdk = 36
+                  }
+              }
+          }
+          EOF
       - run: flutter build apk --release --target-platform android-arm64 --no-shrink
       - uses: actions/upload-artifact@v4
         with:
