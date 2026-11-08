@@ -46,7 +46,7 @@ jobs:
               }
           }
           EOF
-      - run: flutter build apk --release --target-platform android-arm64 --no-shrink
+      - run: flutter build apk --release --target-platform android-arm,android-arm64 --no-shrink
       - uses: actions/upload-artifact@v4
         with:
           name: squeeze-android
